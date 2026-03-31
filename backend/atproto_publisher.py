@@ -1,8 +1,9 @@
 """
 ATProto publisher — posts completed tips as com.linkedclaims.claim records.
 
-Uses httpx for direct ATProto XRPC calls (lightweight, async).
-All errors are caught and logged — publishing never fails a tip.
+Uses the @cooperation/claim-atproto SDK (via Node.js subprocess) for claim
+building, validation, and publishing. The SDK ensures claims conform to the
+DIF Labs LinkedClaims specification.
 
 Claim mapping (tip → LinkedClaims):
   subject    = tipper DID (who made the tip — the person asserting value)
@@ -15,56 +16,59 @@ Claim mapping (tip → LinkedClaims):
   effectiveDate = when the tip was created
 """
 
+import asyncio
+import json
 import logging
-import time
+import os
 from datetime import datetime, timezone
-
-import httpx
 
 from config import settings
 
 log = logging.getLogger("simpletip.atproto")
 
-COLLECTION = "com.linkedclaims.claim"
-
-# ── Session cache ────────────────────────────────────────────
-
-_session: dict | None = None
-_session_expires: float = 0
+# Path to the Node.js publish script that uses claim-atproto SDK
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PUBLISH_SCRIPT = os.path.join(_SCRIPT_DIR, "publish-claim.mjs")
 
 
-async def _get_session() -> dict:
-    """Login via app password, return cached session with accessJwt + did."""
-    global _session, _session_expires
+async def _run_sdk(tip_data: dict) -> dict:
+    """Call the claim-atproto SDK via Node.js subprocess.
 
-    if _session and time.monotonic() < _session_expires:
-        return _session
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.atproto_service}/xrpc/com.atproto.server.createSession",
-            json={
-                "identifier": settings.atproto_handle,
-                "password": settings.atproto_app_password,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    _session = {
-        "accessJwt": data["accessJwt"],
-        "refreshJwt": data["refreshJwt"],
-        "did": data["did"],
+    Returns {"uri": "at://...", "cid": "..."} on success.
+    Raises RuntimeError on failure.
+    """
+    env = {
+        **os.environ,
+        "ATPROTO_HANDLE": settings.atproto_handle,
+        "ATPROTO_APP_PASSWORD": settings.atproto_app_password,
+        "ATPROTO_SERVICE": settings.atproto_service,
     }
-    # Cache for 90 minutes (tokens last ~2 hours)
-    _session_expires = time.monotonic() + 90 * 60
-    return _session
+
+    proc = await asyncio.create_subprocess_exec(
+        "node", _PUBLISH_SCRIPT, json.dumps(tip_data),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        err_msg = stderr.decode().strip() if stderr else "unknown error"
+        try:
+            err_data = json.loads(err_msg)
+            err_msg = err_data.get("error", err_msg)
+        except json.JSONDecodeError:
+            pass
+        raise RuntimeError(f"claim-atproto SDK error: {err_msg}")
+
+    result = json.loads(stdout.decode().strip())
+    return result
 
 
 # ── Publish a single tip ─────────────────────────────────────
 
 async def publish_tip(tip_id, conn) -> str | None:
-    """Build and publish a tip as a LinkedClaim. Returns AT-URI or None on failure."""
+    """Build and publish a tip as a LinkedClaim via the SDK. Returns AT-URI or None on failure."""
     tip = await conn.fetchrow(
         "SELECT t.id, t.wallet_id, t.amount_cents, t.comment, t.page_url, t.created_at, t.atproto_uri "
         "FROM tips t WHERE t.id = $1 AND t.status = 'completed'",
@@ -95,7 +99,7 @@ async def publish_tip(tip_id, conn) -> str | None:
         log.warning("publish_tip: tip %s has no splits", tip_id)
         return None
 
-    # ── Build LinkedClaims record ────────────────────────────
+    # ── Build claim data for the SDK ─────────────────────────
 
     # Subject = the tipper (who is making the claim with their money)
     tipper_did = ""
@@ -120,43 +124,24 @@ async def publish_tip(tip_id, conn) -> str | None:
     else:
         iso_ts = str(created_at)
 
-    record = {
-        "$type": COLLECTION,
+    # Data passed to the SDK script
+    tip_data = {
         "subject": tipper_did,
-        "claimType": "tip",
         "object": receiver_names,
         "statement": statement,
-        "confidence": 1.0,
         "effectiveDate": iso_ts,
         "createdAt": iso_ts,
     }
-
-    # Source = the content that was tipped for
     if tip["page_url"]:
-        record["source"] = {
-            "uri": tip["page_url"],
-            "howKnown": "FIRST_HAND",
-        }
+        tip_data["sourceUri"] = tip["page_url"]
 
-    # Publish
-    session = await _get_session()
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.atproto_service}/xrpc/com.atproto.repo.createRecord",
-            headers={"Authorization": f"Bearer {session['accessJwt']}"},
-            json={
-                "repo": session["did"],
-                "collection": COLLECTION,
-                "record": record,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
+    # Publish via claim-atproto SDK
+    result = await _run_sdk(tip_data)
 
     at_uri = result.get("uri", "")
     if at_uri:
         await conn.execute("UPDATE tips SET atproto_uri = $1 WHERE id = $2", at_uri, tip_id)
-        log.info("Published tip %s → %s", tip_id, at_uri)
+        log.info("Published tip %s → %s (via claim-atproto SDK)", tip_id, at_uri)
 
     return at_uri
 
@@ -230,45 +215,24 @@ async def publish_summary(conn, since_hours: int = 24) -> str | None:
 
     now_ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
-    record = {
-        "$type": COLLECTION,
+    tip_data = {
         "subject": settings.node_url,
-        "claimType": "tip",
         "object": receivers_str,
         "statement": f"Summary: {tip_count} tips totaling {total_str} to {receivers_str}",
-        "confidence": 1.0,
         "effectiveDate": now_ts,
         "createdAt": now_ts,
+        "sourceUri": settings.node_url,
     }
 
-    if settings.node_url:
-        record["source"] = {
-            "uri": settings.node_url,
-            "howKnown": "FIRST_HAND",
-        }
-
-    session = await _get_session()
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.atproto_service}/xrpc/com.atproto.repo.createRecord",
-            headers={"Authorization": f"Bearer {session['accessJwt']}"},
-            json={
-                "repo": session["did"],
-                "collection": COLLECTION,
-                "record": record,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
+    result = await _run_sdk(tip_data)
 
     at_uri = result.get("uri", "")
     if at_uri:
-        # Mark all tips in the batch as published with the summary URI
         tip_ids = [r["id"] for r in rows]
         await conn.execute(
             "UPDATE tips SET atproto_uri = $1 WHERE id = ANY($2::uuid[])",
             at_uri, tip_ids,
         )
-        log.info("Published summary claim for %d tips → %s", tip_count, at_uri)
+        log.info("Published summary claim for %d tips → %s (via SDK)", tip_count, at_uri)
 
     return at_uri
